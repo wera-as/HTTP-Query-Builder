@@ -1,68 +1,187 @@
 <?php
 
+declare(strict_types=1);
+
 /**
- * Builds an HTTP query string from a provided associative array. This function
- * supports nested arrays, custom delimiter specification, and the option to 
- * preserve numeric indexes in the array keys. It is designed to handle complex data
- * structures for use in GET requests.
+ * Build an HTTP query string from an (optionally nested) array with security guards.
  *
- * @param array  $query_data            The associative array from which the HTTP query will be built.
- * @param string $parent_key            Optional. The parent key for nested arrays, used internally for recursion.
- * @param string $delimiter             Optional. The delimiter used in the query string, defaults to '&'.
- * @param bool   $preserveNumericIndexes Optional. Specifies whether to preserve numeric indexes in array keys, defaults to false.
+ * Security / robustness upgrades:
+ * - RFC 3986 encoding by default (rawurlencode, spaces => %20) to avoid ambiguity.
+ * - Key sorting for deterministic output (can disable).
+ * - Depth and pair-count guards to prevent runaway recursion and memory abuse.
+ * - Strict typing + input validation; rejects resources/unsupported objects.
+ * - Safe delimiter whitelist (& or ;) with graceful fallback.
+ * - Consistent scalar normalization (bools, nulls, floats, DateTimeInterface).
  *
- * @return array An associative array containing the error status and either the error message or the constructed HTTP query.
+ * Back-compat: keeps the original signature. New $options param is optional.
+ *
+ * @param array  $query_data             Input data.
+ * @param string $parent_key             (Internal) Parent key for recursion.
+ * @param string $delimiter              Delimiter between pairs. Only "&" and ";" allowed.
+ * @param bool   $preserveNumericIndexes Preserve numeric indexes (e.g., preferences[0]=x) instead of [].
+ * @param array  $options                Optional behavior tweaks:
+ *   - 'encode'            => 'rfc3986'|'rfc1738' (default 'rfc3986')
+ *   - 'bool_format'       => 'int'|'word'|'string'   (default 'int') // int: 1/0, word: true/false, string: "true"/"false"
+ *   - 'null_format'       => 'omit'|'empty'|'string' (default 'omit') // omit: skip pairs, empty: key=, string: "null"
+ *   - 'datetime_format'   => string DateTime format (default DATE_ATOM)
+ *   - 'max_depth'         => int (default 50)
+ *   - 'max_pairs'         => int (default 10000)
+ *   - 'sort_keys'         => bool (default true)
+ *
+ * @return array ['error' => bool, 'message' => string|null, 'query' => string|null]
  *
  * @example
- * // Example usage of the function
- * $data = [
- *     'user' => [
- *         'name' => 'John',
- *         'details' => [
- *             'age' => 30,
- *             'city' => 'New York'
- *         ]
- *     ],
- *     'preferences' => ['movies', 'books'],
- *     'newsletter' => true
- * ];
- *
  * $result = build_http_query_from_array($data);
+ * if ($result['error']) { echo $result['message']; } else { echo $result['query']; }
  *
- * if ($result['error']) {
- *     echo 'Error: ' . $result['message'];
- * } else {
- *     echo 'Query: ' . $result['query'];
- * }
- *
- * // This will output:
- * // Query: user[name]=John&user[details][age]=30&user[details][city]=New+York&preferences[0]=movies&preferences[1]=books&newsletter=1
- *
- * @author WERA AS
- * @version 1.2.0
+ * @author  WERA AS
+ * @version 2.0.0
  */
-function build_http_query_from_array($query_data, $parent_key = '', $delimiter = '&', $preserveNumericIndexes = false)
-{
-    if (!is_array($query_data)) {
-        return ['error' => true, 'message' => 'Invalid input. Expected an array.'];
+
+function build_http_query_from_array(
+    array $query_data,
+    string $parent_key = '',
+    string $delimiter = '&',
+    bool $preserveNumericIndexes = false,
+    array $options = []
+): array {
+
+    $opts = array_merge([
+        'encode'          => 'rfc3986',
+        'bool_format'     => 'int',
+        'null_format'     => 'omit',
+        'datetime_format' => DATE_ATOM,
+        'max_depth'       => 50,
+        'max_pairs'       => 10000,
+        'sort_keys'       => true,
+    ], $options);
+
+    if (!in_array($delimiter, ['&', ';'], true)) {
+        $delimiter = '&';
     }
+    if (!in_array($opts['encode'], ['rfc3986', 'rfc1738'], true)) {
+        $opts['encode'] = 'rfc3986';
+    }
+    if (!in_array($opts['bool_format'], ['int', 'word', 'string'], true)) {
+        $opts['bool_format'] = 'int';
+    }
+    if (!in_array($opts['null_format'], ['omit', 'empty', 'string'], true)) {
+        $opts['null_format'] = 'omit';
+    }
+    $maxDepth = max(1, (int)$opts['max_depth']);
+    $maxPairs = max(1, (int)$opts['max_pairs']);
+    $sortKeys = (bool)$opts['sort_keys'];
 
-    $query = [];
-    foreach ($query_data as $key => $value) {
-        $encoded_key = $parent_key === '' ? urlencode($key) : $parent_key . '[' . urlencode($key) . ']';
+    $encodeKey = function (string $s) use ($opts): string {
+        return $opts['encode'] === 'rfc1738' ? urlencode($s) : rawurlencode($s);
+    };
+    $encodeVal = $encodeKey;
 
-        if (is_array($value)) {
-            $sub_query = build_http_query_from_array($value, $encoded_key, $delimiter, $preserveNumericIndexes);
-            if ($sub_query['error']) {
-                return $sub_query;
-            }
-            $query[] = $sub_query['query'];
-        } elseif (is_scalar($value) || is_null($value)) {
-            $query[] = "{$encoded_key}=" . urlencode($value);
-        } else {
-            return ['error' => true, 'message' => "Invalid type in query data at key '{$key}'."];
+    $normalizeScalar = function ($v) use ($opts): ?string {
+        if (is_bool($v)) {
+            return match ($opts['bool_format']) {
+                'word'   => $v ? 'true' : 'false',
+                'string' => $v ? 'true' : 'false',
+                default  => $v ? '1' : '0',
+            };
         }
+        if ($v === null) {
+            return match ($opts['null_format']) {
+                'empty'  => '',
+                'string' => 'null',
+                'omit'   => null,
+            };
+        }
+        if ($v instanceof \DateTimeInterface) {
+            return $v->format($opts['datetime_format']);
+        }
+        if (is_int($v)) {
+            return (string)$v;
+        }
+        if (is_float($v)) {
+            $s = number_format($v, 14, '.', '');
+            $s = rtrim(rtrim($s, '0'), '.');
+            return $s === '' ? '0' : $s;
+        }
+        if (is_string($v)) {
+            return $v;
+        }
+        if (is_resource($v) || is_object($v)) {
+            return null;
+        }
+        return (string)$v;
+    };
+
+    $pairs = [];
+    $pairCount = 0;
+
+    $build = function ($data, string $parent, int $depth) use (
+        &$build,
+        &$pairs,
+        &$pairCount,
+        $maxDepth,
+        $maxPairs,
+        $sortKeys,
+        $preserveNumericIndexes,
+        $encodeKey,
+        $encodeVal,
+        $normalizeScalar
+    ): ?array {
+        if ($depth > $maxDepth) {
+            return ['error' => true, 'message' => "Max depth of {$maxDepth} exceeded."];
+        }
+
+        if (!is_array($data)) {
+            return ['error' => true, 'message' => 'Invalid input. Expected an array at current level.'];
+        }
+
+        if ($sortKeys) {
+            uksort($data, static function ($a, $b) {
+                return strcmp((string)$a, (string)$b);
+            });
+        }
+
+        foreach ($data as $key => $value) {
+            $keyStr = (string)$key;
+            $encodedKey = $parent === ''
+                ? $encodeKey($keyStr)
+                : (
+                    is_int($key) && !$preserveNumericIndexes
+                    ? $parent . '[]'
+                    : $parent . '[' . $encodeKey($keyStr) . ']'
+                );
+
+            if (is_array($value)) {
+                $res = $build($value, $encodedKey, $depth + 1);
+                if ($res !== null && $res['error'] ?? false) {
+                    return $res;
+                }
+            } else {
+                $normalized = $normalizeScalar($value);
+
+                if ($normalized === null) {
+                    if (is_resource($value) || is_object($value)) {
+                        return ['error' => true, 'message' => "Invalid type in query data at key '{$keyStr}'."];
+                    }
+                    continue;
+                }
+
+                $pairCount++;
+                if ($pairCount > $maxPairs) {
+                    return ['error' => true, 'message' => "Max pair count of {$maxPairs} exceeded."];
+                }
+
+                $pairs[] = $encodedKey . '=' . $encodeVal($normalized);
+            }
+        }
+
+        return null;
+    };
+
+    $err = $build($query_data, $parent_key, 1);
+    if (is_array($err) && ($err['error'] ?? false)) {
+        return ['error' => true, 'message' => $err['message'] ?? 'Unknown error', 'query' => null];
     }
 
-    return ['error' => false, 'query' => implode($delimiter, $query)];
+    return ['error' => false, 'message' => null, 'query' => implode($delimiter, $pairs)];
 }
